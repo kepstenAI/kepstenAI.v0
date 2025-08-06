@@ -39,7 +39,7 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app.secret_key = "app_secret_will_be_here"
 call_data_store = {}
-NGROK_DOMAIN = "https://d4aa43545439.ngrok-free.app"
+NGROK_DOMAIN = "https://kepstenai-v0.onrender.com/"
 
 
 def save_request_to_db(data, confirmation=None, booking_time=None):
