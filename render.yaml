@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: kepsten-booking-app
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    autoDeploy: true
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        value: TWILIO_ACCOUNT_SID_here
+      - key: TWILIO_AUTH_TOKEN
+        value: TWILIO_AUTH_TOKEN_here
+      - key: TWILIO_PHONE_NUMBER
+        value: TWILIO_PHONE_NUMBER_here
