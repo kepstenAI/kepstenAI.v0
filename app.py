@@ -4,7 +4,8 @@ from twilio.rest import Client
 from ai.mistral_client import get_mistral_response
 from ai.elevenlabs_client import generate_voice
 import urllib.parse
-
+import pandas as pd
+import re
 from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 
 
@@ -155,14 +156,60 @@ def voice():
     """, 200, {'Content-Type': 'application/xml'}
 
 
+# Load services from Excel at startup
+services_df = pd.read_excel("services.xlsx")  # Must have columns: Service, Price
+
+def find_service_info(query):
+    for _, row in services_df.iterrows():
+        if re.search(row["Service"], query, re.IGNORECASE):
+            return row["Service"], row["Price"]
+    return None, None
+
+def is_service_question(user_input):
+    # Common ways users might ask about services
+    keywords = [
+        "service", "services", "what do you do", "what can you do",
+        "offer", "provide", "available services", "cleaning options"
+    ]
+    return any(kw in user_input for kw in keywords)
+
 @app.route('/gather', methods=['POST'])
 def gather():
-    user_input = request.form.get('SpeechResult', '').lower()
+    user_input = request.form.get('SpeechResult', '').strip().lower()
     phone = request.args.get("phone")
     data = call_data_store.get(phone, {})
 
-    if "yes" in user_input or "i did" in user_input:
-        # Update DB with confirmation
+    # If user says nothing
+    if not user_input:
+        retry_prompt = "I didn’t catch that. Could you please repeat?"
+        audio_url = generate_voice(retry_prompt)
+        return f"""
+        <Response>
+            <Play>{audio_url}</Play>
+            <Gather bargeIn="true" input="speech" action="{NGROK_DOMAIN}/gather?phone={urllib.parse.quote_plus(phone)}"
+                    method="POST" timeout="5" speechTimeout="auto"/>
+        </Response>
+        """, 200, {'Content-Type': 'application/xml'}
+
+    # ✅ Handle service-related questions (Excel-driven)
+    if is_service_question(user_input):
+        services_list = ", ".join(services_df["Service"].tolist())
+        ai_response = f"We currently offer the following services: {services_list}. Which one are you interested in?"
+    
+    elif "where you got my number" in user_input or "from where" in user_input:
+        ai_response = f"We received your contact details from your service request for {data.get('service', 'our services')}."
+    
+    elif "what service" in user_input and "request" in user_input:
+        ai_response = f"You requested our {data.get('service', 'service')} service."
+    
+    elif "price" in user_input or "cost" in user_input:
+        service_name, price = find_service_info(user_input)
+        if service_name and price:
+            ai_response = f"The price for {service_name} is {price}."
+        else:
+            ai_response = "Could you specify which service you’re asking about?"
+    
+    elif "yes" in user_input or "i did" in user_input:
         save_request_to_db({
             "name": data.get("name"),
             "email": data.get("email"),
@@ -170,26 +217,31 @@ def gather():
             "service": data.get("service"),
             "message": data.get("message")
         }, confirmation="yes")
-
-        return f"""
-        <Response>
-            <Say>Great! When would you like our team to come for the {data.get('service')} service?</Say>
-            <Gather input="speech" action="{NGROK_DOMAIN}/confirm-time?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="5" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
-
-    else:
-        # Continue conversation
-        prompt = f"You are Ava from Kepsten. The user replied: '{user_input}'. Respond warmly again, ask them to confirm their service request for {data.get('service')}."
-        ai_response = get_mistral_response(prompt)
+        ai_response = f"Great! When would you like our team to come for the {data.get('service')} service?"
         audio_url = generate_voice(ai_response)
-
         return f"""
         <Response>
             <Play>{audio_url}</Play>
-            <Gather input="speech" action="{NGROK_DOMAIN}/gather?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="5" speechTimeout="auto"/>
+            <Gather bargeIn="true" input="speech" action="{NGROK_DOMAIN}/confirm-time?phone={urllib.parse.quote_plus(phone)}"
+                    method="POST" timeout="5" speechTimeout="auto"/>
         </Response>
         """, 200, {'Content-Type': 'application/xml'}
+    
+    else:
+        prompt = f"You are Ava from Kepsten. The user said: '{user_input}'. Respond warmly, keeping the conversation natural."
+        ai_response = get_mistral_response(prompt)
+
+    audio_url = generate_voice(ai_response)
+    return f"""
+    <Response>
+        <Play>{audio_url}</Play>
+        <Gather bargeIn="true" input="speech" action="{NGROK_DOMAIN}/gather?phone={urllib.parse.quote_plus(phone)}"
+                method="POST" timeout="5" speechTimeout="auto"/>
+    </Response>
+    """, 200, {'Content-Type': 'application/xml'}
+
+
+
 
 
 @app.route('/confirm-time', methods=['POST'])
