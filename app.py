@@ -4,7 +4,7 @@ import json
 import sqlite3
 from datetime import date, timedelta
 from typing import List, Tuple, Optional, Dict
-
+from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 from flask import Flask, request, jsonify, render_template
 from twilio.rest import Client
 import urllib.parse
@@ -29,9 +29,6 @@ except Exception:
 
 
 # ----------------------------- Config --------------------------------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "your_sid")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "your_token")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "your_twilio_number")
 
 # Public base for Twilio webhook callbacks (set to your ngrok/render domain)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://kepstenai-v0.onrender.com").rstrip("/")
