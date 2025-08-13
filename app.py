@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import date, timedelta
 from typing import List, Tuple, Optional, Dict
+
 from config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER
 from flask import Flask, request, jsonify, render_template
 from twilio.rest import Client
@@ -24,7 +25,6 @@ try:
 except Exception:
     def generate_voice(text: str) -> Optional[str]:
         # fallback: return None to indicate use <Say> rather than <Play>
-        # or return a pseudo-URL if you prefer <Play>.
         return None
 
 
@@ -139,7 +139,7 @@ def safe_get(url: str) -> Optional[str]:
 
 def parse_and_store_services():
     """Lightweight scraper for kepsten house-cleaning section & deep-cleaning category.
-       Stores results in services table. This is best-effort and uses simple selectors."""
+       Stores results in services and faqs tables. This is best-effort and uses simple selectors."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -177,7 +177,7 @@ def parse_and_store_services():
         products = psoup.select("li.product, .product")
         for prod in products:
             # title
-            title_el = prod.select_one(".woocommerce-loop-product__title, h2, .product_title")
+            title_el = prod.select_one(".woocommerce-loop-product__title, h2, .product_title, a")
             title = title_el.get_text(strip=True) if title_el else None
             # price
             price_el = prod.select_one("ins .amount, .price .amount, .price, .amount")
@@ -192,7 +192,7 @@ def parse_and_store_services():
     if deep_html:
         dsoup = BeautifulSoup(deep_html, "html.parser")
         for prod in dsoup.select("li.product, .product"):
-            title_el = prod.select_one(".woocommerce-loop-product__title, h2, a")
+            title_el = prod.select_one(".woocommerce-loop-product__title, h2, a, .product_title")
             title = title_el.get_text(strip=True) if title_el else None
             price_el = prod.select_one("ins .amount, .price .amount, .price, .amount")
             price = price_el.get_text(" ", strip=True) if price_el else ""
@@ -200,19 +200,17 @@ def parse_and_store_services():
             if title:
                 upsert(title, desc, price, category="Deep Cleaning", meta={"source": DEEP_CLEANING_CATEGORY})
 
-    # FAQs: store as "service" rows or separate table
+    # FAQs: store in faqs table
     for faq_url in FAQ_URLS:
         fhtml = safe_get(faq_url)
         if not fhtml:
             continue
         fsoup = BeautifulSoup(fhtml, "html.parser")
         # look for common toggles / accordions
-        # elementor / et_pb etc.
-        toggles = fsoup.select(".et_pb_toggle, .faq, .faq-item, details, .elementor-accordion-item")
+        toggles = fsoup.select(".et_pb_toggle, .faq, .faq-item, details, .elementor-accordion-item, .accordion-item")
         for t in toggles:
-            # try common structures
-            q_el = t.select_one(".et_pb_toggle_title, summary, h3, h4, .question, .faq-question")
-            a_el = t.select_one(".et_pb_toggle_content, .answer, p, .elementor-tab-content, .faq-answer")
+            q_el = t.select_one(".et_pb_toggle_title, summary, h3, h4, .question, .faq-question, .accordion-title")
+            a_el = t.select_one(".et_pb_toggle_content, .answer, p, .elementor-tab-content, .faq-answer, .accordion-content")
             q = q_el.get_text(" ", strip=True) if q_el else None
             a = a_el.get_text(" ", strip=True) if a_el else None
             if q and a:
@@ -228,7 +226,7 @@ def parse_and_store_services():
     conn.close()
 
 
-# Run scraper at startup (best-effort). Comment if you want manual reindex only.
+# Run scraper at startup (best-effort). Comment this line if you prefer manual reindex.
 try:
     parse_and_store_services()
 except Exception:
@@ -281,8 +279,17 @@ def search_knowledge_base(query: str, limit: int = 6) -> List[Tuple[str, str, st
     cur = conn.cursor()
     cur.execute("SELECT name, description, price FROM services WHERE name LIKE ? OR description LIKE ? LIMIT ?", (q, q, limit))
     rows = cur.fetchall()
+    # Also search faqs for exact question matches / helpful snippets
+    cur.execute("SELECT question, answer FROM faqs WHERE question LIKE ? OR answer LIKE ? LIMIT ?", (q, q, limit))
+    faqs = cur.fetchall()
     conn.close()
-    return rows
+    # Return services first, then faqs as (question, answer, '')
+    results: List[Tuple[str, str, str]] = []
+    for r in rows:
+        results.append((r[0], r[1], r[2]))
+    for f in faqs:
+        results.append((f[0], f[1], ""))
+    return results
 
 
 # ------------------------- Flask + Twilio Setup -------------------------
@@ -290,52 +297,36 @@ app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET_KEY", "app_secret_will_be_here")
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# ephemeral call state (in-memory)
+# ephemeral call / conversation state (in-memory)
 call_state: Dict[str, Dict] = {}
 
 
 # ---------------------- TwiML helpers -----------------------
-def twiml_play_or_say(text_or_url: Optional[str], gather_action: str):
-    """If generator returned an http URL, use <Play>, otherwise use <Say> with text."""
-    if text_or_url and isinstance(text_or_url, str) and text_or_url.lower().startswith("http"):
-        return f"""
-        <Response>
-            <Play>{text_or_url}</Play>
-            <Gather input="speech" action="{gather_action}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
-    else:
-        # If generate_voice returned None, treat the original text (passed in gather_action state) as say text.
-        # In our code below we pass the actual text into generate_voice; if it returns None we will use the text.
-        say_text = text_or_url if text_or_url and not text_or_url.startswith("http") else ""
-        return f"""
-        <Response>
-            <Say>{say_text}</Say>
-            <Gather input="speech" action="{gather_action}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
-
-
-def respond_play_or_say(text: str, next_action: str):
-    """Wrap: try to produce audio_url via generate_voice(); fallback to Say."""
+def respond_with_text_or_audio(text: str, next_action: str):
+    """
+    Try to generate audio via generate_voice(text). If audio_url is returned (http...), use <Play>.
+    Otherwise fallback to <Say> with the text.
+    """
     audio_url = None
     try:
         audio_url = generate_voice(text)
     except Exception:
         audio_url = None
-    if audio_url:
+
+    if audio_url and isinstance(audio_url, str) and audio_url.lower().startswith("http"):
         return f"""
         <Response>
             <Play>{audio_url}</Play>
-            <Gather bargeIn="true" input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
+            <Gather input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
         </Response>
         """, 200, {'Content-Type': 'application/xml'}
     else:
-        # Use Say with the text
+        # Twilio <Say> expects plaintext; keep it short
+        safe_text = text.replace("&", "and")
         return f"""
         <Response>
-            <Say>{text}</Say>
-            <Gather bargeIn="true" input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
+            <Say>{safe_text}</Say>
+            <Gather input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
         </Response>
         """, 200, {'Content-Type': 'application/xml'}
 
@@ -416,7 +407,9 @@ def trigger_call():
         "message": message,
         "city": city,
         "address": address,
-        "phase": "intro"
+        "phase": "intro",
+        "stage": "greeting",
+        "data": {}
     }
 
     try:
@@ -438,28 +431,8 @@ def voice():
     name = state.get("name") or "there"
     service = state.get("service") or "cleaning"
 
-    prompt = f"Hi {name}, this is Ava from Kepsten. We received your request for {service}. Is now a good time to confirm details?"
-    audio_url = None
-    try:
-        audio_url = generate_voice(prompt)
-    except Exception:
-        audio_url = None
-
-    # Use Play if audio_url, else Say
-    if audio_url:
-        return f"""
-        <Response>
-            <Play>{audio_url}</Play>
-            <Gather input="speech" action="{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
-    else:
-        return f"""
-        <Response>
-            <Say>{prompt}</Say>
-            <Gather input="speech" action="{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
+    prompt = f"Hi {name}, this is Ava from Kepsten. We received your request for {service}. How can I help you today?"
+    return respond_with_text_or_audio(prompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
 
 # ------------------------- Twilio: Incoming call -------------------------
@@ -467,218 +440,186 @@ def voice():
 def incoming_call():
     caller = request.values.get('From') or "unknown"
     # initialize state
-    call_state.setdefault(caller, {"phase": "intro"})
+    call_state.setdefault(caller, {"phase": "intro", "stage": "greeting", "data": {}})
     prompt = "Hi, I'm Ava from Kepsten. How can I help you today?"
-    audio_url = None
-    try:
-        audio_url = generate_voice(prompt)
-    except Exception:
-        audio_url = None
-
-    if audio_url:
-        return f"""
-        <Response>
-            <Play>{audio_url}</Play>
-            <Gather input="speech" action="{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(caller)}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
-    else:
-        return f"""
-        <Response>
-            <Say>{prompt}</Say>
-            <Gather input="speech" action="{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(caller)}" method="POST" timeout="6" speechTimeout="auto"/>
-        </Response>
-        """, 200, {'Content-Type': 'application/xml'}
+    return respond_with_text_or_audio(prompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(caller)}")
 
 
 # ------------------------- Conversation: gather + routing -------------------------
 EMAIL_REGEX = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 
 
-def detect_simple_intent(text: str) -> str:
-    t = (text or "").lower()
-    if any(x in t for x in ["book", "schedule", "i want", "i'd like", "please book", "yes", "confirm", "sounds good"]):
-        return "book"
-    if re.search(EMAIL_REGEX, t) or "email" in t:
-        return "email"
-    if any(k in t for k in ["address", "street", "avenue", "road", "apt", "suite", "city", "postal", "code"]):
-        return "location"
-    if any(k in t for k in ["today", "tomorrow", "am", "pm", "morning", "evening"]):
-        return "availability"
-    if any(k in t for k in ["deep cleaning", "standard cleaning", "move", "post construction", "hourly"]):
-        return "service_choice"
-    return "question"
+def detect_booking_intent(user_input: str) -> bool:
+    kws = ["book", "schedule", "appointment", "clean my", "need cleaning", "i need", "i want cleaning", "can you clean"]
+    t = (user_input or "").lower()
+    return any(kw in t for kw in kws)
 
 
 @app.route('/gather', methods=['POST'])
 def gather():
-    user_input = (request.form.get('SpeechResult') or "").strip()
     phone = request.args.get("phone") or request.values.get('From') or request.values.get('Caller') or "unknown"
-    state = call_state.setdefault(phone, {})
+    user_input = (request.form.get('SpeechResult') or request.values.get('SpeechResult') or request.form.get('SpeechResult') or "").strip()
+    state = call_state.setdefault(phone, {"phase": "intro", "stage": "greeting", "data": {}})
 
+    # If there's no user input (empty), reprompt
     if not user_input:
-        fallback = "Sorry, I didn't catch that. Could you please repeat?"
-        audio_url = generate_voice(fallback) if callable(generate_voice) else None
-        if audio_url:
-            return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+        reprompt = "Sorry, I didn't catch that. How can I help you?"
+        return respond_with_text_or_audio(reprompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
+
+    # record raw user interaction
+    record_interaction(phone, "user", user_input, "")
+
+    # 1) Check KB (services + faqs) for direct answer/helpful info first
+    kb_results = search_knowledge_base(user_input, limit=4)
+    if kb_results:
+        # prefer an exact service match or short summary
+        first = kb_results[0]
+        name, desc, price = first
+        summary = f"{name}."
+        if price:
+            summary += f" Price: {price}."
         else:
-            return f"<Response><Say>{fallback}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+            # use a short snippet of description
+            snippet = (desc[:200] + "...") if desc and len(desc) > 200 else desc
+            if snippet:
+                summary += f" {snippet}"
+        # Offer continuation: booking or more info
+        follow = " Would you like to book this or hear more options?"
+        reply = summary + follow
+        # Save AI response record
+        record_interaction(phone, "kb_reply", user_input, reply)
+        return respond_with_text_or_audio(reply, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-    # record interaction
-    record_interaction(phone, "user_speech", user_input, "")
+    # 2) If KB didn't match, detect booking intent
+    if detect_booking_intent(user_input) or state.get("stage") in ("ask_service", "ask_bedrooms", "confirm_booking", "ask_name", "ask_city", "ask_address", "ask_slot"):
+        # booking flow
+        stage = state.get("stage", "greeting")
+        data = state.setdefault("data", {})
 
-    # Quick KB lookup
-    kb = search_knowledge_base(user_input)
-    if kb:
-        # Summarize first few results (short)
-        parts = []
-        for name, desc, price in kb[:3]:
-            p = name
-            if price:
-                p += f" — {price}"
-            parts.append(p)
-        reply = "I found: " + "; ".join(parts) + ". Would you like to book one of these?"
-        audio_url = generate_voice(reply) if callable(generate_voice) else None
-        if audio_url:
-            return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-        else:
-            return f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-
-    # No KB result — route via simple intent/dialog flow
-    intent = detect_simple_intent(user_input)
-
-    # If we are mid-booking, follow the booking sub-flow
-    phase = state.get("phase")
-
-    # If not started booking and user asked to book, begin
-    if intent == "book" and phase not in ("collecting", "confirming"):
-        state["phase"] = "collecting"
-        # ask for service choice if not present
-        if not state.get("service"):
+        # If stage not started and user asked to book, ask for service
+        if stage in ("greeting", None):
+            state["stage"] = "ask_service"
+            call_state[phone] = state
             prompt = "Sure — which service would you like? We offer Standard Cleaning, Deep Cleaning, Move In/Move Out, Post Construction, and Hourly Packages."
-        else:
-            prompt = "Great. Can I get the full name for the booking?"
-        audio_url = generate_voice(prompt) if callable(generate_voice) else None
-        if audio_url:
-            return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-        else:
-            return f"<Response><Say>{prompt}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+            return respond_with_text_or_audio(prompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-    # If collecting details: capture name, email, city, address, then availability
-    if phase == "collecting":
-        # Capture name if not present
-        if not state.get("name"):
-            state["name"] = user_input
-            reply = "Thanks. What's the best email address for confirmation?"
-            state["phase"] = "collecting"
-            audio_url = generate_voice(reply) if callable(generate_voice) else None
-            if audio_url:
-                return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-            else:
-                return f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+        # user answering service
+        if stage == "ask_service":
+            data["service"] = user_input
+            state["stage"] = "ask_bedrooms"
+            call_state[phone] = state
+            prompt = "How many bedrooms should we plan for? (1, 2, 3, 4, 5)"
+            return respond_with_text_or_audio(prompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-        # Capture email
-        if not state.get("email"):
-            m = re.search(EMAIL_REGEX, user_input)
+        # capture bedrooms
+        if stage == "ask_bedrooms":
+            m = re.search(r"\b([1-5])\b", user_input)
             if m:
-                state["email"] = m.group(0)
+                data["bedrooms"] = int(m.group(1))
             else:
-                # user might have spelled it — accept raw and confirm later
-                state["email"] = user_input
-            reply = "Thanks. Which city are you in?"
-            audio_url = generate_voice(reply) if callable(generate_voice) else None
-            return (f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}) if audio_url else (f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'})
+                # accept words like 'three'
+                words_to_nums = {"one":1, "two":2, "three":3, "four":4, "five":5}
+                for w,n in words_to_nums.items():
+                    if w in user_input.lower():
+                        data["bedrooms"] = n
+                        break
+            state["stage"] = "confirm_booking"
+            call_state[phone] = state
 
-        # Capture city
-        if not state.get("city"):
-            state["city"] = user_input
-            reply = "Great — can you provide the street address (or nearest intersection)?"
-            audio_url = generate_voice(reply) if callable(generate_voice) else None
-            return (f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}) if audio_url else (f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'})
+            # try to find price for exact bedroom package in services
+            price_text = ""
+            kb = search_knowledge_base(data.get("service", ""), limit=10)
+            for name, desc, price in kb:
+                # match by bedroom number in product title like "3 Bedroom Package"
+                if data.get("bedrooms") and str(data["bedrooms"]) in name:
+                    price_text = f"The {name} costs {price}."
+                    break
 
-        # Capture address
-        if not state.get("address"):
-            state["address"] = user_input
-            # ask bedrooms if service is deep cleaning or not specified
-            svc = (state.get("service") or "").lower()
-            if "deep" in svc or "deep" in (user_input.lower() or ""):
-                state["phase"] = "collecting"
-                reply = "How many bedrooms should we plan for? 1, 2, 3, 4 or 5?"
+            if not price_text:
+                # best-effort: give a short generic line
+                price_text = "I can get you a quote based on bedrooms — would you like me to book a slot and then confirm price by email?"
+            prompt = price_text + " Would you like to proceed and book?"
+            return respond_with_text_or_audio(prompt, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
+
+        # confirmation to book
+        if stage == "confirm_booking":
+            if "yes" in user_input.lower() or "sure" in user_input.lower() or "please" in user_input.lower():
+                state["stage"] = "ask_name"
+                call_state[phone] = state
+                return respond_with_text_or_audio("Great — may I have your full name, please?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
             else:
-                reply = "Thanks — would you like a slot for today or tomorrow, AM or PM?"
-                state["phase"] = "availability"
-            audio_url = generate_voice(reply) if callable(generate_voice) else None
-            return (f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}) if audio_url else (f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'})
+                state["stage"] = "greeting"
+                call_state[phone] = state
+                return respond_with_text_or_audio("No problem — anything else I can help with?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-        # Capture bedrooms (if needed)
-        if "bedrooms" not in state and ("deep" in (state.get("service") or "").lower() or re.search(r"\b(1|2|3|4|5)\b", user_input)):
-            m = re.search(r"\b(1|2|3|4|5)\b", user_input)
-            if m:
-                state["bedrooms"] = int(m.group(1))
-                state["phase"] = "availability"
-                reply = "Thanks — would you like a slot for today or tomorrow, AM or PM?"
-                audio_url = generate_voice(reply) if callable(generate_voice) else None
-                return (f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}) if audio_url else (f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'})
+        # capture name
+        if stage == "ask_name":
+            data["name"] = user_input
+            state["stage"] = "ask_city"
+            call_state[phone] = state
+            return respond_with_text_or_audio("Thanks. Which city are you in?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-    # Availability phase: parse today/tomorrow AM/PM or explicit date slot
-    if state.get("phase") in ("availability",):
-        t = user_input.lower()
-        chosen_day = None
-        if "today" in t:
-            chosen_day = date.today().isoformat()
-        elif "tomorrow" in t:
-            chosen_day = (date.today() + timedelta(days=1)).isoformat()
-        else:
-            m = re.search(r"(20\d{2}-\d{2}-\d{2})", t)
-            if m:
-                chosen_day = m.group(1)
-        slot = None
-        if "am" in t or "morning" in t:
-            slot = "AM"
-        elif "pm" in t or "evening" in t or "afternoon" in t:
-            slot = "PM"
-        if not chosen_day or not slot:
-            # ask clarifying
-            reply = "Would you prefer AM or PM, and is that for today or tomorrow?"
-            audio_url = generate_voice(reply) if callable(generate_voice) else None
-            return (f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}) if audio_url else (f"<Response><Say>{reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'})
+        # capture city
+        if stage == "ask_city":
+            data["city"] = user_input
+            state["stage"] = "ask_address"
+            call_state[phone] = state
+            return respond_with_text_or_audio("And your full address (or nearest intersection)?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-        # All details gathered: save booking
-        booking_data = {
-            "name": state.get("name"),
-            "email": state.get("email"),
-            "phone": phone,
-            "city": state.get("city"),
-            "address": state.get("address"),
-            "service": state.get("service"),
-            "bedrooms": state.get("bedrooms"),
-            "message": state.get("message")
-        }
-        save_request_to_db(booking_data, confirmation="yes", booking_time=f"{chosen_day} {slot}")
-        # mark slot taken
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO availability_slots(day, slot, is_available) VALUES (?, ?, 0) ON CONFLICT(day, slot) DO UPDATE SET is_available=0", (chosen_day, slot))
-        conn.commit()
-        conn.close()
+        # capture address
+        if stage == "ask_address":
+            data["address"] = user_input
+            state["stage"] = "ask_slot"
+            call_state[phone] = state
+            return respond_with_text_or_audio("When would you like the service — today or tomorrow, AM or PM?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-        state["phase"] = "done"
-        resp_text = f"Booked {state.get('service', 'your service')} for {chosen_day} {slot}. We'll email confirmation to {state.get('email')}. Anything else I can help with?"
-        audio_url = generate_voice(resp_text) if callable(generate_voice) else None
-        if audio_url:
-            return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-        else:
-            return f"<Response><Say>{resp_text}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+        # capture slot & finalize booking
+        if stage == "ask_slot":
+            # parse day and am/pm
+            t = user_input.lower()
+            chosen_day = None
+            if "today" in t:
+                chosen_day = date.today().isoformat()
+            elif "tomorrow" in t:
+                chosen_day = (date.today() + timedelta(days=1)).isoformat()
+            else:
+                m = re.search(r"(20\d{2}-\d{2}-\d{2})", t)
+                if m:
+                    chosen_day = m.group(1)
+            slot = None
+            if "am" in t or "morning" in t:
+                slot = "AM"
+            elif "pm" in t or "evening" in t or "afternoon" in t:
+                slot = "PM"
+            if not (chosen_day and slot):
+                # ask again
+                return respond_with_text_or_audio("Could you say if you want AM or PM, and is it for today or tomorrow?", f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
-    # Default: use LLM to answer freeform question
-    prompt = f"You are Ava from Kepsten. The user said: '{user_input}'. Answer briefly and naturally; include helpful service info if known."
+            booking_time = f"{chosen_day} {slot}"
+            data["booking_time"] = booking_time
+            data["phone"] = phone
+            # persist booking
+            try:
+                save_request_to_db(data, confirmation="yes", booking_time=booking_time)
+                # mark slot taken
+                conn = sqlite3.connect(DB_PATH)
+                cur = conn.cursor()
+                cur.execute("INSERT INTO availability_slots(day, slot, is_available) VALUES (?, ?, 0) ON CONFLICT(day, slot) DO UPDATE SET is_available=0", (chosen_day, slot))
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
+            state["stage"] = "done"
+            call_state[phone] = state
+            reply = f"Booked {data.get('service','service')} for {booking_time}. We'll email confirmation to {data.get('email','the email you provided')}. Anything else I can help with?"
+            return respond_with_text_or_audio(reply, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
+
+    # 3) Default: fallback to LLM (Mistral) for freeform Q/A
+    prompt = f"You are Ava from Kepsten. The user said: '{user_input}'. Answer briefly, warmly, and helpfully. If useful, mention we can book a cleaning."
     ai_reply = get_mistral_response(prompt)
-    audio_url = generate_voice(ai_reply) if callable(generate_voice) else None
     record_interaction(phone, "ai_reply", user_input, ai_reply)
-    if audio_url:
-        return f"<Response><Play>{audio_url}</Play><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
-    else:
-        return f"<Response><Say>{ai_reply}</Say><Gather input='speech' action='{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}' method='POST' timeout='6' speechTimeout='auto'/></Response>", 200, {'Content-Type': 'application/xml'}
+    return respond_with_text_or_audio(ai_reply, f"{PUBLIC_BASE_URL}/gather?phone={urllib.parse.quote_plus(phone)}")
 
 
 # ------------------------- Simple confirm-time endpoint -------------------------
@@ -691,8 +632,12 @@ def confirm_time():
         txt = f"Thank you. We've scheduled your service for {user_time}. Goodbye!"
     else:
         txt = "We didn't catch a time. Goodbye!"
-    audio_url = generate_voice(txt) if callable(generate_voice) else None
-    if audio_url:
+    audio_url = None
+    try:
+        audio_url = generate_voice(txt)
+    except Exception:
+        audio_url = None
+    if audio_url and isinstance(audio_url, str) and audio_url.lower().startswith("http"):
         return f"<Response><Play>{audio_url}</Play><Hangup/></Response>", 200, {'Content-Type': 'application/xml'}
     else:
         return f"<Response><Say>{txt}</Say><Hangup/></Response>", 200, {'Content-Type': 'application/xml'}
