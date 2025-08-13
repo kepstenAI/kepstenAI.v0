@@ -6,3 +6,5 @@ gTTS
 gunicorn
 pandas
 openpyxl
+beautifulsoup4
+lxml
