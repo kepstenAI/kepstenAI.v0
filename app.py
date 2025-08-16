@@ -316,10 +316,8 @@ def respond_with_text_or_audio(text: str, next_action: str):
     if audio_url and isinstance(audio_url, str) and audio_url.lower().startswith("http"):
         return f"""
         <Response>
-            
-            <Gather input="speech" bargeIn="true action="{next_action}" method="POST" timeout="6" speechTimeout="auto"> 
             <Play>{audio_url}</Play>
-            </Gather>
+            <Gather input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
         </Response>
         """, 200, {'Content-Type': 'application/xml'}
     else:
@@ -328,9 +326,7 @@ def respond_with_text_or_audio(text: str, next_action: str):
         return f"""
         <Response>
             <Say>{safe_text}</Say>
-            <Gather input="speech" bargeIn="true action="{next_action}" method="POST" timeout="6" speechTimeout="auto"> 
-            <Play>{audio_url}</Play>
-            </Gather>
+            <Gather input="speech" action="{next_action}" method="POST" timeout="6" speechTimeout="auto"/>
         </Response>
         """, 200, {'Content-Type': 'application/xml'}
 
@@ -642,21 +638,15 @@ def confirm_time():
     except Exception:
         audio_url = None
     if audio_url and isinstance(audio_url, str) and audio_url.lower().startswith("http"):
-     return f"""
-        <Response>
-            <Gather input="speech" bargeIn="true" action="{NGROK_DOMAIN}/gather?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="5" speechTimeout="auto">
-                <Play>{audio_url}</Play>
-            </Gather>
-        </Response>
-    """, 200, {'Content-Type': 'application/xml'}
+        return f"<Response><Play>{audio_url}</Play><Hangup/></Response>", 200, {'Content-Type': 'application/xml'}
     else:
-     return f"""
-        <Response>
-            <Gather input="speech" bargeIn="true" action="{NGROK_DOMAIN}/gather?phone={urllib.parse.quote_plus(phone)}" method="POST" timeout="5" speechTimeout="auto">
-                <Say>{txt}</Say>
-            </Gather>
-        </Response>
-    """, 200, {'Content-Type': 'application/xml'} 
+        return f"<Response><Say>{txt}</Say><Hangup/></Response>", 200, {'Content-Type': 'application/xml'}
+
+
+@app.route('/sheetconn', methods=['GET'])
+def print():
+    print('hello google sheet is working')
+
 
 
 # ------------------------- Run app -------------------------
