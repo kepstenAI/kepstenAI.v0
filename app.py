@@ -643,12 +643,40 @@ def confirm_time():
         return f"<Response><Say>{txt}</Say><Hangup/></Response>", 200, {'Content-Type': 'application/xml'}
 
 
-@app.route('/sheetconn', methods=['GET'])
-def print():
-    print('hello google sheet is working')
+FILE_PATH = "sheet_data.json"
+
+@app.route('/sheetconn', methods=['POST'])
+def sheetconn():
+    try:
+        data = request.get_json()  # Get JSON payload from Google Sheet
+        if not data:
+            return jsonify({"error": "No JSON data received"}), 400
+
+        # If file doesn't exist, create empty list
+        if not os.path.exists(FILE_PATH):
+            with open(FILE_PATH, "w") as f:
+                json.dump([], f)
+
+        # Read existing data
+        with open(FILE_PATH, "r") as f:
+            existing_data = json.load(f)
+
+        # Append new record
+        existing_data.append(data)
+
+        # Write back to file
+        with open(FILE_PATH, "w") as f:
+            json.dump(existing_data, f, indent=4)
+
+        return jsonify({"status": "success", "message": "Data saved"}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 
 # ------------------------- Run app -------------------------
 if __name__ == '__main__':
+
     app.run(host='0.0.0.0', port=5000, debug=True)
